@@ -1,13 +1,13 @@
 <script setup lang="ts">
 import { ref, watch, computed } from 'vue';
-import { buildRequirementTree, recalculateNodeInputs, recursivelyRecalculate, buildTreeFromMachineCount } from './logic/recipeCalculator';
+import { calculateRequirements, buildFinalTree, getFullTreeState, allCraftableItems, recipeMap } from './logic/recipeCalculator';
 import { generateMermaidString } from './logic/graphGenerator';
 import RecipeTree from './components/RecipeTree.vue';
 import SettingsPanel from './components/SettingsPanel.vue';
 import GraphView from './components/GraphView.vue';
 import type { RequirementNode } from './types/types';
-import { settings } from './logic/settings';
-import { enToJa } from './logic/translations'; // 翻訳データをインポート
+import { settings, sparkTypes } from './logic/settings';
+import { enToJa } from './logic/translations';
 
 const targetItem = ref('Stellar Ice');
 const targetRate = ref(10);
@@ -22,7 +22,6 @@ const isGraphVisible = ref(false);
 const graphMermaidCode = ref('');
 const graphStartNodeName = ref('');
 
-// --- ▼ 追加: 翻訳ヘルパー関数 ---
 const t = (key: string): string => {
   if (settings.language === 'ja' && enToJa[key]) {
     return enToJa[key];
@@ -30,47 +29,97 @@ const t = (key: string): string => {
   return key;
 };
 
-const calculate = () => {
+const translatedCraftableItems = computed(() => {
+    return allCraftableItems.map(item => ({
+        value: item,
+        text: t(item)
+    })).sort((a, b) => a.text.localeCompare(b.text, 'ja'));
+});
+
+
+const calculate = (persistedState: any = null) => {
   if (!targetItem.value) {
-    errorMessage.value = settings.language === 'ja' ? 'アイテム名を入力してください。' : 'Please enter an item name.';
+    errorMessage.value = t('Please enter an item name.');
     requirementsTree.value = null;
     return;
   }
-  
   try {
     errorMessage.value = '';
-    if (calculationMode.value === 'output') {
-      if (targetRate.value <= 0) {
-        errorMessage.value = settings.language === 'ja' ? '有効な生産数を入力してください。' : 'Please enter a valid production rate.';
-        requirementsTree.value = null;
-        return;
-      }
-      const itemsPerSecond = targetRate.value / 60;
-      requirementsTree.value = buildRequirementTree(targetItem.value, itemsPerSecond);
-    } else {
-      if (machineCount.value <= 0) {
-        errorMessage.value = settings.language === 'ja' ? '有効な設備台数を入力してください。' : 'Please enter a valid machine count.';
-        requirementsTree.value = null;
-        return;
-      }
-      requirementsTree.value = buildTreeFromMachineCount(targetItem.value, machineCount.value);
+    let newTree;
+    let rootRate = 0;
+    const rootItemName = targetItem.value;
+
+    let state = persistedState;
+    if (!state) {
+        state = { root: { name: rootItemName, rate: 0 } };
     }
+    state.root.name = rootItemName;
+
+    if (calculationMode.value === 'output') {
+        if (targetRate.value <= 0) {
+            errorMessage.value = t('Please enter a valid production rate.');
+            requirementsTree.value = null;
+            return;
+        }
+        rootRate = targetRate.value / 60;
+    } else {
+          if (machineCount.value <= 0) {
+            errorMessage.value = t('Please enter a valid machine count.');
+            requirementsTree.value = null;
+            return;
+        }
+          const recipes = recipeMap.get(rootItemName);
+        if (!recipes || recipes.length === 0) throw new Error(`Recipe not found for item: ${rootItemName}`);
+
+        let recipeIndex = 0;
+        if (state[rootItemName] && state[rootItemName].selectedRecipeIndices.length > 0) {
+            recipeIndex = state[rootItemName].selectedRecipeIndices[0];
+        } else {
+            state[rootItemName] = { selectedRecipeIndices: [0] };
+        }
+          const recipe = recipes[recipeIndex];
+          const mainOutput = recipe.output.find(o => o.name === rootItemName) || recipe.output[0];
+
+        const sparkCountMultiplier = settings.sparkCount;
+        const sparkTypeMultiplier = sparkTypes[settings.sparkType as keyof typeof sparkTypes] || 1.0;
+        const totalSpeedMultiplier = sparkCountMultiplier * sparkTypeMultiplier;
+        const effectiveSpeed = recipe.speed / totalSpeedMultiplier;
+        const timeInSeconds = effectiveSpeed * (recipe.cycles || 1);
+        let recipeRatePerMachine = mainOutput.quantity / timeInSeconds;
+        if (recipe.workstation === 'Arboretum') {
+            recipeRatePerMachine *= settings.arboretumFeederCount;
+        }
+        rootRate = recipeRatePerMachine * machineCount.value;
+    }
+    
+    state.root.rate = rootRate;
+    
+    const netRequirements = calculateRequirements(state);
+    newTree = buildFinalTree(rootItemName, rootRate, netRequirements, state);
+
+    requirementsTree.value = newTree;
+
   } catch (error: any) {
-    errorMessage.value = `${settings.language === 'ja' ? '計算エラー' : 'Calculation error'}: ${error.message}`;
+    errorMessage.value = `${t('Calculation error')}: ${error.message}`;
     requirementsTree.value = null;
     console.error(error);
   }
 };
 
-const handleRecipeSelectionChange = (payload: { node: RequirementNode }) => {
-  recalculateNodeInputs(payload.node);
+const handleRecipeSelectionChange = (payload: { node: RequirementNode, newIndices: number[] }) => {
+  const currentState = getFullTreeState(requirementsTree.value);
+  currentState[payload.node.name].selectedRecipeIndices = payload.newIndices;
+  currentState.root = { name: requirementsTree.value!.name, rate: requirementsTree.value!.rate };
+  calculate(currentState);
 };
 
-watch(settings, () => {
-  if (requirementsTree.value) {
-    recursivelyRecalculate(requirementsTree.value);
-  }
-}, { deep: true }); // deep watchでネストされた変更も検知
+watch(()=> [settings.sparkCount, settings.sparkType, settings.arboretumFeederCount, settings.language], () => {
+    if (requirementsTree.value) {
+          const currentState = getFullTreeState(requirementsTree.value);
+          currentState.root = { name: requirementsTree.value.name, rate: requirementsTree.value.rate };
+          calculate(currentState);
+    }
+}, { deep: true });
 
 const handleShowGraph = (node: RequirementNode) => {
   graphMermaidCode.value = generateMermaidString(node);
@@ -101,7 +150,11 @@ const handleShowGraph = (node: RequirementNode) => {
         </div>
         <div class="input-group">
           <label for="item-name">{{ t('Base Item:') }}</label>
-          <input id="item-name" type="text" v-model="targetItem" />
+          <select id="item-name" v-model="targetItem">
+              <option v-for="item in translatedCraftableItems" :key="item.value" :value="item.value">
+                  {{ item.text }}
+              </option>
+          </select>
         </div>
         <div v-if="calculationMode === 'output'" class="input-group">
           <label for="item-rate">{{ t('Production Rate (items/min):') }}</label>
@@ -111,7 +164,7 @@ const handleShowGraph = (node: RequirementNode) => {
           <label for="machine-count">{{ t('Machine Count:') }}</label>
           <input id="machine-count" type="number" v-model.number="machineCount" />
         </div>
-        <button @click="calculate">{{ t('Calculate') }}</button>
+        <button @click="calculate()">{{ t('Calculate') }}</button>
         <p v-if="calculationMode === 'machines'" class="note">
           {{ t('Note: For items with multiple recipes, the first recipe is used for calculation.') }}
         </p>
@@ -165,7 +218,7 @@ label {
   margin-bottom: 0.5rem; 
   font-size: 0.9em; 
 }
-input { 
+input, select { 
   padding: 0.5rem; 
   border-radius: 4px; 
   border: 1px solid #555; 
@@ -213,3 +266,4 @@ button:hover {
   margin-top: 0.5rem; 
 }
 </style>
+

@@ -3,10 +3,10 @@ import recipeData from '../assets/recipe.json';
 import { jaToEn } from './translations';
 import type { Recipe, RequirementNode, RecipeMap, SourceRecipeInfo } from '../types/types';
 
-const CALCULATION_THRESHOLD = 1e-6;
+const CALCULATION_THRESHOLD = 1e-9;
 
 // --- データの前処理 (変更なし) ---
-const recipeMap: RecipeMap = new Map();
+export const recipeMap: RecipeMap = new Map();
 const rawMaterials = new Set<string>(recipeData.drops.map(d => d.name));
 const workstations = recipeData.recipes[0];
 for (const stationName in workstations) {
@@ -41,117 +41,179 @@ const getCanonicalName = (name: string): string => {
   return name;
 };
 
-// --- ノード再計算関数 (変更なし) ---
-export const recalculateNodeInputs = (node: RequirementNode): void => {
-  if (node.selectedRecipeIndices.length === 0) {
-    node.sourceRecipes = [];
-    return;
-  }
-  const sparkCountMultiplier = settings.sparkCount;
-  const sparkTypeMultiplier = sparkTypes[settings.sparkType as keyof typeof sparkTypes] || 1.0;
-  const totalSpeedMultiplier = sparkCountMultiplier * sparkTypeMultiplier;
-  const splitRate = node.rate / node.selectedRecipeIndices.length;
-  const sourceRecipes: SourceRecipeInfo[] = [];
-  node.selectedRecipeIndices.forEach(index => {
-    const recipe = node.recipeOptions![index];
-    const mainOutput = recipe.output[0];
-    const effectiveSpeed = recipe.speed / totalSpeedMultiplier;
-    const timeInSeconds = effectiveSpeed * (recipe.cycles || 1);
-    let recipeRate = mainOutput.quantity / timeInSeconds;
-    if (recipe.workstation === 'Arboretum') {
-      recipeRate *= settings.arboretumFeederCount;
+export const getFullTreeState = (node: RequirementNode | null, state: any = {}): any => {
+    if (!node) return state;
+    state[node.name] = { selectedRecipeIndices: [...node.selectedRecipeIndices] };
+    if (node.sourceRecipes) {
+        node.sourceRecipes.forEach(source => {
+            source.inputs.forEach(child => getFullTreeState(child, state));
+        });
     }
-    const machinesNeeded = splitRate / recipeRate;
-    const inputs = recipe.materials?.map(material => {
-      const materialQty = material.quantity || 1;
-      let requiredRate: number;
-      if (recipe.cycles) {
-        let cyclesPerSecond = machinesNeeded * (recipe.cycles / timeInSeconds);
-        if (recipe.workstation === 'Arboretum') {
-          cyclesPerSecond *= settings.arboretumFeederCount;
+    return state;
+};
+
+
+export const calculateRequirements = (persistedState: any): Map<string, number> => {
+    const requirements: Map<string, number> = new Map();
+    const byproducts: Map<string, number> = new Map();
+    const toProcess: Map<string, number> = new Map();
+
+    const rootItemName = getCanonicalName(persistedState.root.name);
+    toProcess.set(rootItemName, persistedState.root.rate);
+    requirements.set(rootItemName, persistedState.root.rate);
+
+    let iterations = 0;
+    const MAX_ITERATIONS = 50; 
+
+    while (toProcess.size > 0 && iterations < MAX_ITERATIONS) {
+        iterations++;
+        const processingQueue = new Map(toProcess);
+        toProcess.clear();
+
+        for (const [itemName, requiredRate] of processingQueue.entries()) {
+            if (rawMaterials.has(itemName)) continue;
+
+            const recipes = recipeMap.get(itemName);
+            if (!recipes) continue;
+
+            let selectedIndices: number[] = [];
+            if (persistedState[itemName] && persistedState[itemName].selectedRecipeIndices) {
+                selectedIndices = persistedState[itemName].selectedRecipeIndices;
+            } else {
+                selectedIndices = recipes.length === 1 ? [0] : [];
+                persistedState[itemName] = { selectedIndices };
+            }
+
+            if (selectedIndices.length === 0) continue;
+            
+            const splitRate = requiredRate / selectedIndices.length;
+
+            selectedIndices.forEach(index => {
+                const recipe = recipes[index];
+                const targetOutput = recipe.output.find(o => o.name === itemName);
+                if (!targetOutput) return;
+
+                const sparkCountMultiplier = settings.sparkCount;
+                const sparkTypeMultiplier = sparkTypes[settings.sparkType as keyof typeof sparkTypes] || 1.0;
+                const totalSpeedMultiplier = sparkCountMultiplier * sparkTypeMultiplier;
+                const effectiveSpeed = recipe.speed / totalSpeedMultiplier;
+                const timeInSeconds = effectiveSpeed * (recipe.cycles || 1);
+                
+                let recipeRateOfTargetOutput = targetOutput.quantity / timeInSeconds;
+                if (recipe.workstation === 'Arboretum') {
+                    recipeRateOfTargetOutput *= settings.arboretumFeederCount;
+                }
+
+                const machinesNeeded = recipeRateOfTargetOutput > 0 ? splitRate / recipeRateOfTargetOutput : 0;
+                
+                recipe.output.forEach(out => {
+                    if (out.name !== itemName) {
+                        const byproductRate = (out.quantity / timeInSeconds) * machinesNeeded;
+                        byproducts.set(out.name, (byproducts.get(out.name) || 0) + byproductRate);
+                    }
+                });
+                
+                recipe.materials?.forEach(mat => {
+                    const materialRate = (mat.quantity / timeInSeconds) * machinesNeeded;
+                    const currentReq = requirements.get(mat.name) || 0;
+                    requirements.set(mat.name, currentReq + materialRate);
+                    toProcess.set(mat.name, (toProcess.get(mat.name) || 0) + materialRate);
+                });
+            });
         }
-        requiredRate = materialQty * cyclesPerSecond;
-      } else {
-        requiredRate = materialQty * machinesNeeded;
-      }
-      return buildRequirementTree(material.name, requiredRate, node.ancestry);
-    }) || [];
-    sourceRecipes.push({ recipe, rate: splitRate, machines: machinesNeeded, inputs });
-  });
-  node.sourceRecipes = sourceRecipes;
+    }
+
+    const netRequirements = new Map<string, number>();
+    for (const [name, rate] of requirements.entries()) {
+        const netRate = rate - (byproducts.get(name) || 0);
+        if (netRate > CALCULATION_THRESHOLD) {
+            netRequirements.set(name, netRate);
+        }
+    }
+    return netRequirements;
+}
+
+export const buildFinalTree = (rootItemName: string, rootRate: number, netRequirements: Map<string, number>, persistedState: any): RequirementNode | null => {
+    const buildNode = (itemName: string, requiredRate: number, ancestry: Set<string>): RequirementNode | null => {
+        const canonicalItemName = getCanonicalName(itemName);
+         if (requiredRate < CALCULATION_THRESHOLD) return null;
+
+        if (ancestry.has(canonicalItemName)) {
+            const netRate = netRequirements.get(canonicalItemName) || 0;
+             if(netRate < CALCULATION_THRESHOLD) return null;
+            return { name: canonicalItemName, rate: netRate, selectedRecipeIndices: [], ancestry, isCircular: true };
+        }
+        const newAncestry = new Set(ancestry);
+        newAncestry.add(canonicalItemName);
+
+        if (rawMaterials.has(canonicalItemName)) {
+            return { name: canonicalItemName, rate: requiredRate, selectedRecipeIndices: [], ancestry: newAncestry };
+        }
+
+        const recipes = recipeMap.get(canonicalItemName);
+        if (!recipes) {
+            return { name: canonicalItemName, rate: requiredRate, selectedRecipeIndices: [], ancestry: newAncestry };
+        }
+
+        let selectedIndices: number[] = [];
+        if(persistedState[canonicalItemName] && persistedState[canonicalItemName].selectedRecipeIndices){
+            selectedIndices = persistedState[canonicalItemName].selectedRecipeIndices;
+        } else if (recipes) {
+            selectedIndices = recipes.length === 1 ? [0] : [];
+        }
+        
+        const node: RequirementNode = {
+            name: canonicalItemName,
+            rate: requiredRate,
+            recipeOptions: recipes,
+            selectedRecipeIndices: selectedIndices,
+            ancestry: newAncestry,
+            sourceRecipes: []
+        };
+
+        if (selectedIndices.length > 0) {
+            const splitRate = requiredRate / selectedIndices.length;
+            
+            selectedIndices.forEach(index => {
+                 const recipe = recipes[index];
+                 const targetOutput = recipe.output.find(o => o.name === canonicalItemName);
+                 if (!targetOutput) return;
+
+                const sparkCountMultiplier = settings.sparkCount;
+                const sparkTypeMultiplier = sparkTypes[settings.sparkType as keyof typeof sparkTypes] || 1.0;
+                const totalSpeedMultiplier = sparkCountMultiplier * sparkTypeMultiplier;
+                const effectiveSpeed = recipe.speed / totalSpeedMultiplier;
+                const timeInSeconds = effectiveSpeed * (recipe.cycles || 1);
+                
+                let recipeRateOfTargetOutput = targetOutput.quantity / timeInSeconds;
+                if (recipe.workstation === 'Arboretum') {
+                    recipeRateOfTargetOutput *= settings.arboretumFeederCount;
+                }
+
+                const machinesNeeded = recipeRateOfTargetOutput > 0 ? splitRate / recipeRateOfTargetOutput : 0;
+                
+                const inputs = recipe.materials?.map(mat => {
+                     const totalProducedByRecipe = (mat.quantity! / timeInSeconds) * machinesNeeded;
+                     return buildNode(mat.name, totalProducedByRecipe, newAncestry);
+
+                }).filter((n): n is RequirementNode => n !== null);
+                
+                 node.sourceRecipes!.push({
+                    recipe,
+                    rate: splitRate,
+                    machines: machinesNeeded,
+                    inputs
+                });
+            });
+        }
+
+        return node;
+    };
+
+    const root = buildNode(rootItemName, rootRate, new Set());
+    return root;
 };
 
-// --- ツリー初期構築関数 (変更なし) ---
-export const buildRequirementTree = (
-  itemName: string,
-  itemsPerSecond: number,
-  ancestry: Set<string> = new Set()
-): RequirementNode => {
-  const canonicalItemName = getCanonicalName(itemName);
-  if (itemsPerSecond < CALCULATION_THRESHOLD || ancestry.has(canonicalItemName)) {
-    return { name: canonicalItemName, rate: itemsPerSecond, selectedRecipeIndices: [], ancestry };
-  }
-  const newAncestry = new Set(ancestry);
-  newAncestry.add(canonicalItemName);
-  if (rawMaterials.has(canonicalItemName)) {
-    return { name: canonicalItemName, rate: itemsPerSecond, selectedRecipeIndices: [], ancestry: newAncestry };
-  }
-  const recipes = recipeMap.get(canonicalItemName);
-  if (!recipes || recipes.length === 0) {
-    return { name: canonicalItemName, rate: itemsPerSecond, selectedRecipeIndices: [], ancestry: newAncestry };
-  }
-  const initialSelection = recipes.length === 1 ? [0] : [];
-  const node: RequirementNode = {
-    name: canonicalItemName,
-    rate: itemsPerSecond,
-    recipeOptions: recipes,
-    selectedRecipeIndices: initialSelection,
-    ancestry: newAncestry,
-    sourceRecipes: []
-  };
-  if (initialSelection.length > 0) {
-    recalculateNodeInputs(node);
-  }
-  return node;
-};
-
-// --- 設備台数から逆算する関数 (変更なし) ---
-export const buildTreeFromMachineCount = (
-  itemName: string,
-  machineCount: number
-): RequirementNode => {
-  const canonicalItemName = getCanonicalName(itemName);
-  const recipes = recipeMap.get(canonicalItemName);
-  if (!recipes || recipes.length === 0) {
-    throw new Error(`Recipe not found for item: ${canonicalItemName}`);
-  }
-  const recipe = recipes[0];
-  const mainOutput = recipe.output[0];
-  const sparkCountMultiplier = settings.sparkCount;
-  const sparkTypeMultiplier = sparkTypes[settings.sparkType as keyof typeof sparkTypes] || 1.0;
-  const totalSpeedMultiplier = sparkCountMultiplier * sparkTypeMultiplier;
-  const effectiveSpeed = recipe.speed / totalSpeedMultiplier;
-  const timeInSeconds = effectiveSpeed * (recipe.cycles || 1);
-  let recipeRatePerMachine = mainOutput.quantity / timeInSeconds;
-  if (recipe.workstation === 'Arboretum') {
-    recipeRatePerMachine *= settings.arboretumFeederCount;
-  }
-  const totalOutputRate = recipeRatePerMachine * machineCount;
-  return buildRequirementTree(canonicalItemName, totalOutputRate);
-};
-
-// --- 既存の関数 (変更なし) ---
-export const recursivelyRecalculate = (node: RequirementNode): void => {
-  recalculateNodeInputs(node);
-  if (node.sourceRecipes) {
-    node.sourceRecipes.forEach(source => {
-      source.inputs.forEach(childNode => {
-        recursivelyRecalculate(childNode);
-      });
-    });
-  }
-};
 
 // --- ▼ 追加: 全ての生産可能なアイテムのリストをエクスポート ---
 export const allCraftableItems: string[] = Array.from(recipeMap.keys()).sort();
-

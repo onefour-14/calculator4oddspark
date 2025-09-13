@@ -1237,6 +1237,26 @@
                     ],
                     "speed": 24,
                     "temperature": -3
+                },  
+                {
+                    "output": [
+                        {
+                            "name": "Copper Ingot",
+                            "quantity": 1
+                        }
+                    ],
+                    "workstation": "Furnace",
+                    "materials": [
+                        {
+                            "name": "Copper Seed",
+                            "quantity": 3
+                        },
+                        {
+                            "name": "fuel"
+                        }
+                    ],
+                    "speed": 64,
+                    "temperature": -3
                 },
                 {
                     "output": [

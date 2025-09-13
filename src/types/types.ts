@@ -36,5 +36,7 @@ export interface RequirementNode {
     // --- ▼ 修正: `inputs` を削除し `sourceRecipes` で管理 ---
     sourceRecipes?: SourceRecipeInfo[];
     ancestry: Set<string>;
+    isCircular?: boolean;
     // `machines` と `workstation` は SourceRecipeInfo に移動したため削除
 }
+

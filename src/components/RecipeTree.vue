@@ -1,8 +1,9 @@
 <script setup lang="ts">
-import type { PropType } from 'vue';
+import { ref, watch, PropType } from 'vue';
 import type { RequirementNode, Recipe } from '../types/types';
 import { settings } from '../logic/settings';
 import { enToJa } from '../logic/translations';
+import RecipeTree from './RecipeTree.vue';
 
 const props = defineProps({
   node: {
@@ -22,7 +23,7 @@ const t = (key: string): string => {
 };
 
 const onSelectionChange = () => {
-  emit('recipeSelectionChanged', { node: props.node });
+  emit('recipeSelectionChanged', { node: props.node, newIndices: selectedIndices.value });
 };
 
 const showGraphForNode = () => {
@@ -34,25 +35,34 @@ const recipeDescription = (recipe: Recipe) => {
   const materials = recipe.materials?.map(m => `${t(m.name)} x${m.quantity || 1}`).join(', ') || t('None');
   return `${workstation} (${t('Materials')}: ${materials})`;
 };
+
+const selectedIndices = ref([...props.node.selectedRecipeIndices]);
+
+watch(() => props.node.selectedRecipeIndices, (newVal) => {
+    if (JSON.stringify(newVal) !== JSON.stringify(selectedIndices.value)) {
+        selectedIndices.value = [...newVal];
+    }
+});
 </script>
 
 <template>
-  <div class="recipe-node">
+  <div class="recipe-node" v-if="node && node.rate > 0">
     <div class="node-content">
       <div class="node-main-line">
         <button @click="showGraphForNode" class="graph-button" :title="t('Show dependency graph')">📊</button>
         <strong class="item-name">{{ t(node.name) }}</strong>
         <span class="rate">{{ (node.rate * 60).toFixed(3) }} {{ t('items/min') }}</span>
+        <span v-if="node.isCircular" class="circular-ref">(循環参照)</span>
       </div>
     </div>
     
-    <div v-if="node.recipeOptions && node.recipeOptions.length > 1" class="recipe-selector">
+    <div v-if="node.recipeOptions && node.recipeOptions.length > 1 && !node.isCircular" class="recipe-selector">
       <div v-for="(recipe, index) in node.recipeOptions" :key="index" class="checkbox-wrapper">
         <input 
           type="checkbox" 
           :id="`${node.name}-${index}`" 
           :value="index"
-          v-model="node.selectedRecipeIndices"
+          v-model="selectedIndices"
           @change="onSelectionChange"
         >
         <label :for="`${node.name}-${index}`">{{ recipeDescription(recipe) }}</label>
@@ -136,6 +146,11 @@ ul {
 }
 .item-name { color: #e0e0e0; }
 .rate { color: #3498db; font-weight: bold; }
+.circular-ref {
+    color: #f1c40f;
+    font-size: 0.8em;
+    font-style: italic;
+}
 .recipe-selector {
   margin: 10px 0;
   padding: 10px;
@@ -209,3 +224,4 @@ label { cursor: pointer; }
   background: #555;
 }
 </style>
+
